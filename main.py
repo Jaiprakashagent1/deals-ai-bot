@@ -6,7 +6,6 @@ import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Render కోసం డమ్మీ పోర్ట్ సర్వర్
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     handler = http.server.SimpleHTTPRequestHandler
@@ -15,12 +14,13 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# API Keys క్లీన్ చేయడం
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip().replace('\n', '').replace('\r', '')
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().replace('\n', '').replace('\r', '')
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash-latest')
+
+# 100% వర్క్ అయ్యే మోడల్ పేరు
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("AI Deals Bot is Active! Send me product details or links.")
