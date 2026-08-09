@@ -88,8 +88,23 @@ BRAND_SUFFIX_PATTERN = re.compile(
     flags=re.IGNORECASE
 )
 
+def parse_app_share_text(raw_text: str) -> tuple:
+    """Flipkart / Amazon యాప్ షేర్ మెసేజ్ల నుండి ప్రొడక్ట్ టైటిల్ & ప్రైస్‌ను పట్టుకునే ఫంక్షన్."""
+    title = ""
+    price = ""
+    
+    # Match 'Take a look at this <Title> on Flipkart'
+    fk_match = re.search(r'Take a look at this\s+(.*?)\s+on Flipkart', raw_text, flags=re.IGNORECASE)
+    if fk_match:
+        title = fk_match.group(1).strip()
+
+    price_match = re.search(r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d{1,2})?)', raw_text, flags=re.IGNORECASE)
+    if price_match:
+        price = f"₹{price_match.group(1)}"
+
+    return title, price
+
 def extract_title_from_url_slug(url: str) -> str:
-    """Fallback: URL అడ్రస్ ఆధారంగా ప్రొడక్ట్ పేరును ఎక్స్‌ట్రాక్ట్ చేసే ఫంక్షన్."""
     try:
         path = unquote(urlparse(url).path)
         parts = [p for p in path.split('/') if p]
@@ -103,6 +118,10 @@ def extract_title_from_url_slug(url: str) -> str:
     return ""
 
 def clean_title(raw_title: str, final_url: str, raw_user_text: str) -> str:
+    share_title, _ = parse_app_share_text(raw_user_text)
+    if share_title:
+        return share_title
+
     title = (raw_title or "").strip()
     title = BRAND_SUFFIX_PATTERN.sub('', title).strip()
 
@@ -116,7 +135,6 @@ def clean_title(raw_title: str, final_url: str, raw_user_text: str) -> str:
     return title if title else "Featured Deal Product"
 
 def extract_flipkart_price(html_text: str) -> str:
-    """Flipkart JS డేటా నుండి డిస్కౌంట్ ప్రైస్‌ను వెతికే స్మార్ట్ ఎక్స్‌ట్రాక్టర్."""
     patterns = [
         r'"finalPrice"\s*:\s*\{\s*"value"\s*:\s*(\d+)',
         r'"minPrice"\s*:\s*(\d+)',
@@ -157,12 +175,14 @@ def extract_price_from_text(text: str) -> str:
 
 def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
     final_url = url
+    _, text_price = parse_app_share_text(raw_user_text)
+
     try:
         session = requests.Session()
         res = session.get(url, headers=headers, timeout=10, allow_redirects=True)
@@ -178,7 +198,7 @@ def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
         desc = og_desc["content"].strip() if og_desc and og_desc.get("content") else ""
 
         # Price Extraction Hierarchy
-        price = extract_flipkart_price(res.text)
+        price = text_price or extract_flipkart_price(res.text)
         if not price:
             meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
             price = f"₹{meta_price['content'].strip()}" if meta_price and meta_price.get("content") else ""
@@ -199,7 +219,7 @@ def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
         return {
             "url": url,
             "title": clean_title("", url, raw_user_text),
-            "price": "Check Link",
+            "price": text_price if text_price else "Check Link",
             "desc": "",
         }
 
