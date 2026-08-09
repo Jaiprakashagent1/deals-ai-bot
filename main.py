@@ -6,6 +6,7 @@ import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Render డమ్మీ పోర్ట్ సర్వర్
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     handler = http.server.SimpleHTTPRequestHandler
@@ -14,8 +15,9 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# API Keys శుభ్రపరచడం (ఏ విధమైన స్పేస్‌లు, క్యారెక్టర్లు ఉన్నా తొలగిస్తుంది)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip().replace('\n', '').replace('\r', '')
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().replace('\n', '').replace('\r', '')
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
@@ -48,3 +50,4 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
+
