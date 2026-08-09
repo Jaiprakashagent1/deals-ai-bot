@@ -6,31 +6,43 @@ import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Render కోసం డమ్మీ వెబ్ సర్వర్ (Port Error రాకుండా ఉండటానికి)
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("", port), handler) as httpd:
+    with socketserver.TCPServer(( "", port), handler) as httpd:
         httpd.serve_forever()
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# AI & Telegram Bot కోడ్
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+# మోడల్ పేరును gemini-1.5-flash గా మార్చడం జరిగింది
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("AI Deals Bot is Active!")
+    await update.message.reply_text("AI Deals Bot is Active! Send me product details or links.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    prompt = f"Analyze this deal or product link and create a catchy Telegram post with formatting, discount details, and store comparisons:\n{user_text}"
     
-    response = model.generate_content(prompt)
-    await update.message.reply_text(response.text)
+    prompt = f"""
+    Create an engaging Telegram post for the channel 'Ai deals of today' using the following deal info or link:
+    {user_text}
+    
+    Include:
+    - Product Title
+    - Key Highlights/Benefits
+    - Call to Action with Link
+    - Relevant Emojis and Formatting
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        await update.message.reply_text(response.text)
+    except Exception as e:
+        await update.message.reply_text(f"Error processing deal: {str(e)}")
 
 if __name__ == '__main__':
     app = Application.builder().token(TELEGRAM_TOKEN).build()
