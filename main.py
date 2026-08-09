@@ -2,10 +2,11 @@ import os
 import http.server
 import socketserver
 import threading
-import google.generativeai as genai
+from groq import Groq
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Render డమ్మీ పోర్ట్ సర్వర్
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     handler = http.server.SimpleHTTPRequestHandler
@@ -15,15 +16,12 @@ def run_dummy_server():
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
-genai.configure(api_key=GEMINI_API_KEY)
-
-# 100% వర్క్ అయ్యే మోడల్ పేరు
-model = genai.GenerativeModel('gemini-2.0-flash')
+client = Groq(api_key=GROQ_API_KEY)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("AI Deals Bot is Active! Send me product details or links.")
+    await update.message.reply_text("AI Deals Bot is Active with Groq! Send me product details or links.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
@@ -40,8 +38,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     
     try:
-        response = model.generate_content(prompt)
-        await update.message.reply_text(response.text)
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        response_text = completion.choices[0].message.content
+        await update.message.reply_text(response_text)
     except Exception as e:
         await update.message.reply_text(f"Error processing deal: {str(e)}")
 
