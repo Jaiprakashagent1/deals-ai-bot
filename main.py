@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import sqlite3
 import requests
 import http.server
@@ -46,21 +47,72 @@ init_db()
 # 4. Security Verification Helper (Admin Authorization Lock)
 def is_admin(user_id: int) -> bool:
     if not ADMIN_CHAT_ID:
-        return True  # Allows access during initial setup if ADMIN_CHAT_ID is not set yet
+        return True
     return str(user_id) == str(ADMIN_CHAT_ID)
 
-# 5. Link Scraper & Metadata Extractor
+# 5. Universal E-Commerce Price & Metadata Scraper (Amazon, Flipkart, Myntra, Ajio, Meesho, Nykaa)
 def scrape_link_data(url: str) -> dict:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
     }
     try:
-        res = requests.get(url, headers=headers, timeout=5, allow_redirects=True)
+        res = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
         soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # Extract Product Title
         title = soup.title.string.strip() if soup.title else "Deal Product"
-        return {"url": res.url, "title": title}
+        
+        extracted_price = "Not Found"
+        
+        # Method A: JSON-LD Structured Data Parsing (Most Reliable across Stores)
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string if script.string else "")
+                if isinstance(data, list):
+                    data = data[0]
+                if isinstance(data, dict):
+                    offers = data.get("offers")
+                    if isinstance(offers, dict) and "price" in offers:
+                        extracted_price = str(offers["price"])
+                        break
+                    elif isinstance(offers, list) and len(offers) > 0 and "price" in offers[0]:
+                        extracted_price = str(offers[0]["price"])
+                        break
+            except Exception:
+                continue
+
+        # Method B: OpenGraph & Product Meta Tags (Ajio, Nykaa, Flipkart, Myntra)
+        if extracted_price == "Not Found":
+            meta_price = (
+                soup.find("meta", property="product:price:amount") or 
+                soup.find("meta", property="og:price:amount") or 
+                soup.find("meta", name="twitter:data1")
+            )
+            if meta_price and meta_price.get("content"):
+                extracted_price = meta_price["content"].strip()
+
+        # Method C: Site-Specific CSS Selectors Fallback
+        if extracted_price == "Not Found":
+            # Amazon Selectors
+            price_elem = soup.find("span", class_="a-price-whole") or soup.find("span", id="priceblock_ourprice") or soup.find("span", class_="a-offscreen")
+            if price_elem:
+                extracted_price = price_elem.text.strip()
+            else:
+                # Flipkart / Meesho Selectors
+                fk_price = soup.find("div", class_="_30jeq3") or soup.find("div", class_="Nx9q3U") or soup.find("h8", class_="iBAtLg")
+                if fk_price:
+                    extracted_price = fk_price.text.strip()
+                else:
+                    # Ajio / Nykaa Selectors
+                    fashion_price = soup.find("div", class_="prod-sp") or soup.find("span", class_="css-1jcz222")
+                    if fashion_price:
+                        extracted_price = fashion_price.text.strip()
+
+        return {"url": res.url, "title": title, "price": extracted_price}
     except Exception:
-        return {"url": url, "title": "Deal Product"}
+        return {"url": url, "title": "Deal Product", "price": "Not Found"}
 
 # 6. Multi-Key API Fallback & Critical Admin Alert System
 async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -74,12 +126,11 @@ async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
             completion = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.6,
+                temperature=0.1, # Lowest temperature for absolute factual accuracy & Zero Hallucination
                 max_tokens=1024,
             )
             return completion.choices[0].message.content
         except Exception as e:
-            # Send immediate alert to Admin if all API keys fail
             if idx == len(keys) - 1:
                 if ADMIN_CHAT_ID:
                     try:
@@ -91,7 +142,7 @@ async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
                         pass
                 raise e
 
-# 7. AI Master Prompt Generator
+# 7. AI Master Prompt Generator with ZERO Hallucination & 14 Master Categories
 def build_master_prompt(user_input: str, scraped_info: dict, deal_type: str = "NORMAL") -> str:
     badge_rule = ""
     if deal_type == "BYPASS":
@@ -99,27 +150,29 @@ def build_master_prompt(user_input: str, scraped_info: dict, deal_type: str = "N
     elif deal_type == "SPONSORED":
         badge_rule = "Include Badge: '📢 SPONSORED PROMOTION'"
     else:
-        badge_rule = "Include dynamic smart badges like '📉 PRICE DROPPED!' or '⚡ FLASH DEAL' if applicable."
+        badge_rule = "Include dynamic smart badges like '📉 PRICE DROPPED!' or '⚡ FLASH DEAL' if discount is clear."
 
     return f"""
     You are the Master AI Agent For Deals.
     Generate a high-converting, clean, professional English Telegram deal post based on:
-    - User Request / Input: {user_input}
+    - Raw User Input: {user_input}
     - Scraped Product Title: {scraped_info.get('title', '')}
+    - Scraped Live Price: {scraped_info.get('price', 'Not Found')}
     - Product Link: {scraped_info.get('url', '')}
 
-    Follow these STRICT MASTER SPECIFICATIONS:
-    1. {badge_rule}
-    2. Format Product Title clearly in **Bold**.
-    3. Multi-Store Price Comparison Breakdown:
-       - Show Original MRP vs Deal Price (and Discount %)
-       - Compare prices across major stores (Amazon vs Flipkart vs Myntra) and highlight the Lowest Price platform.
-       - Include Bank/Credit Card Offers (Estimate HDFC/ICICI/SBI if mentioned).
-       - Final Effective Price.
-    4. Provide 3 Bullet Highlights of the product.
-    5. AUTO CATEGORY TAGGING: Append exact hashtags at the very bottom:
-       (Select appropriate ones: #Electronics, #Fashion, #Furniture, #Beauty, #Grocery_Medical, #HomeDecor).
-    6. Include clear Call-To-Action (CTA) with the link. Ensure clean layout with relevant emojis.
+    STRICT ZERO-HALLUCINATION DIRECTIVES:
+    1. NEVER INVENT OR GUESS DATA: Do NOT fabricate unverified MRPs, fake discount percentages, fake bank offers, or unverified technical specs. Use ONLY real facts present in the input or scraped price data.
+    2. STRICT PRICE COMPARISON RULE: Display the official Live Deal Price based on scraped data. NEVER fabricate competitor prices across stores (e.g., Do NOT invent fake prices for Ajio, Flipkart, Meesho, or Nykaa unless exact scraped price data is provided).
+    3. {badge_rule}
+    4. Format Product Title clearly in **Bold**.
+    5. Provide 3 crisp, strictly accurate Bullet Highlights based ONLY on verified product details.
+    6. OFFICIAL 14 MASTER CATEGORIES: Select ONLY 1 or 2 most accurate hashtags strictly from this exact list:
+       [#Automobile, #Electronics, #Fashion, #Furniture, #Home_Kitchen, #Beauty, #Health_PersonalCare, #Medical, #Grocery, #Toys_Games, #Sports_Fitness, #Baby_Kids, #Luggage_Travel, #Books_Stationery].
+       - Example 1: Bike/Car accessories or helmets = #Automobile
+       - Example 2: Kids toys/RC cars = #Toys_Games
+       - Example 3: Travel bags/Luggage = #Luggage_Travel
+       - Example 4: Grooming/Massage guns = #Health_PersonalCare or #Medical
+    7. Clear Call-To-Action (CTA) link with clean layout and relevant emojis.
     """
 
 # 8. Telegram Bot Command & Message Handlers
@@ -150,7 +203,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def bypass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Unauthorized: This command is restricted to Bot Admin.")
+        await update.message.reply_text("⛔ Unauthorized: Restricted to Bot Admin.")
         return
     if not context.args:
         await update.message.reply_text("Usage: /bypass [Product Link/Details]")
@@ -159,7 +212,7 @@ async def bypass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sponsored_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Unauthorized: This command is restricted to Bot Admin.")
+        await update.message.reply_text("⛔ Unauthorized: Restricted to Bot Admin.")
         return
     if not context.args:
         await update.message.reply_text("Usage: /sponsored [Product Link/Details]")
@@ -168,7 +221,7 @@ async def sponsored_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /track [Product Link] [Target Price]\nExample: /track https://amzn.in/... 9500")
+        await update.message.reply_text("Usage: /track [Product Link] [Target Price]")
         return
     try:
         link = context.args[0]
@@ -184,7 +237,7 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         
-        await update.message.reply_text(f"✅ Price Alert Saved! We will alert you when price drops to ₹{target_price:.2f}")
+        await update.message.reply_text(f"✅ Price Alert Saved for ₹{target_price:.2f}")
     except ValueError:
         await update.message.reply_text("❌ Please enter a valid numerical target price.")
 
