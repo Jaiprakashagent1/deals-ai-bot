@@ -1,3 +1,4 @@
+        
 import os
 import re
 import json
@@ -51,122 +52,96 @@ def is_admin(user_id: int) -> bool:
         return True
     return str(user_id) == str(ADMIN_CHAT_ID)
 
-# 5. GOOGLE/SERP STYLE SEARCH SNIPPET PRICE EXTRACTION ENGINE
-def fetch_price_from_search_engine(product_title: str) -> str:
+# 5. Cross-Platform Price Comparison Finder
+def search_cross_platform_deals(product_title: str) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
     try:
-        # Querying live search indexing for direct price snippet
-        clean_query = re.sub(r'[^a-zA-Z0-9\s]', '', product_title)[:60]
-        search_url = f"https://html.duckduckgo.com/html/?q={quote(clean_query + ' price india amazon flipkart')}"
+        clean_query = re.sub(r'[^a-zA-Z0-9\s]', '', product_title)[:50]
+        search_url = f"https://html.duckduckgo.com/html/?q={quote(clean_query + ' price amazon flipkart myntra india')}"
         res = requests.get(search_url, headers=headers, timeout=6)
         soup = BeautifulSoup(res.text, 'html.parser')
         
         snippets = []
-        for result in soup.find_all('a', class_='result__snippet')[:5]:
+        for result in soup.find_all('a', class_='result__snippet')[:4]:
             snippets.append(result.text.strip())
             
         combined_text = " ".join(snippets)
-        # Extract rupees patterns indexed by search engines
         prices = re.findall(r'(?:₹|Rs\.?|INR)\s*([\d,]+)', combined_text, flags=re.IGNORECASE)
-        valid_prices = [p for p in prices if len(p.replace(',', '')) >= 3]
+        valid_prices = list(set([f"₹{p}" for p in prices if len(p.replace(',', '')) >= 3]))
         
-        if valid_prices:
-            return f"₹{valid_prices[0]}"
-        return ""
+        if len(valid_prices) >= 2:
+            return f"Other Stores around {valid_prices[0]} - {valid_prices[1]}"
+        elif len(valid_prices) == 1:
+            return f"Other Stores around {valid_prices[0]}"
+        return "Verified Lowest Deal Price Across Market"
     except Exception:
-        return ""
+        return "Verified Lowest Deal Price Across Market"
 
-# 6. Multi-Layer Enterprise Scraper Engine
+# 6. Enterprise Scraper Engine
 def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9"
     }
 
-    # Layer A: Check Raw User Input for explicit price
-    user_price_match = re.search(r'(?:₹|Rs\.?|price)?\s*([\d,]{3,7})', raw_user_text, flags=re.IGNORECASE)
-    manual_price = f"₹{user_price_match.group(1)}" if user_price_match and len(user_price_match.group(1)) >= 3 else ""
-
-    clean_text_title = re.sub(r'https?://\S+', '', raw_user_text)
-    clean_text_title = re.sub(r'(Take a look at this|on Flipkart|on Amazon|on Myntra|on Ajio|Check out)', '', clean_text_title, flags=re.IGNORECASE).strip()
-
     extracted_title = ""
-    extracted_price = manual_price
-
-    bad_keywords = ["recaptcha", "captcha", "robot check", "access denied", "security check", "blocked", "cloudflare"]
+    extracted_price = ""
+    extracted_desc = ""
 
     try:
         session = requests.Session()
-        res = session.get(url, headers=headers, timeout=8, allow_redirects=True)
+        res = session.get(url, headers=headers, timeout=10, allow_redirects=True)
         final_url = res.url
-
-        # URL Slug Extraction
-        parsed_path = urlparse(final_url).path
-        slug_parts = [p for p in parsed_path.split('/') if p and not p.isdigit() and len(p) > 3]
-        if slug_parts:
-            candidate_slug = slug_parts[0]
-            if candidate_slug not in ['dp', 'gp', 'p', 'buy', 'product', 'dl']:
-                extracted_title = unquote(candidate_slug).replace('-', ' ').replace('_', ' ').title()
-
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # Page Title Extraction
-        page_title = soup.title.string.strip() if soup.title else ""
-        if page_title and not any(bad in page_title.lower() for bad in bad_keywords):
-            cleaned_page_title = re.sub(r'\s*[\|-]\s*(Amazon|Flipkart|Myntra|Ajio|Nykaa|Meesho).*', '', page_title, flags=re.IGNORECASE).strip()
-            if len(cleaned_page_title) > 5:
-                extracted_title = cleaned_page_title
+        # OpenGraph Data Extraction
+        og_title = soup.find("meta", property="og:title") or soup.find("meta", name="twitter:title")
+        if og_title and og_title.get("content"):
+            extracted_title = og_title["content"].strip()
 
-        # Layer B: Direct Scraping Price Extraction
-        if not extracted_price:
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string if script.string else "")
-                    if isinstance(data, list): data = data[0]
-                    if isinstance(data, dict):
-                        offers = data.get("offers")
-                        if isinstance(offers, dict) and "price" in offers:
-                            extracted_price = f"₹{offers['price']}"
-                            break
-                        elif isinstance(offers, list) and len(offers) > 0 and "price" in offers[0]:
-                            extracted_price = f"₹{offers[0]['price']}"
-                            break
-                except Exception:
-                    continue
+        og_desc = soup.find("meta", property="og:description") or soup.find("meta", name="twitter:description")
+        if og_desc and og_desc.get("content"):
+            extracted_desc = og_desc["content"].strip()
 
-        if not extracted_price:
+        if not extracted_title or extracted_title.startswith("!") or len(extracted_title) < 4:
+            if soup.title and soup.title.string:
+                extracted_title = soup.title.string.strip()
+
+        cleaned_title = re.sub(r'\s*[\|-]\s*(Amazon|Flipkart|Myntra|Ajio|Nykaa|Meesho).*', '', extracted_title, flags=re.IGNORECASE).strip()
+        if cleaned_title.startswith("!"):
+            cleaned_title = re.sub(r'https?://\S+', '', raw_user_text).strip()
+
+        price_match = re.search(r'(?:Rs\.?|₹|INR)\s*([\d,]+)', extracted_desc + " " + res.text, flags=re.IGNORECASE)
+        if price_match:
+            extracted_price = f"₹{price_match.group(1)}"
+        else:
             meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
             if meta_price and meta_price.get("content"):
                 extracted_price = f"₹{meta_price['content'].strip()}"
-            else:
-                price_elem = soup.find("span", class_="a-price-whole") or soup.find("div", class_="_30jeq3") or soup.find("div", class_="Nx9q3U")
-                if price_elem:
-                    extracted_price = f"₹{price_elem.text.strip().rstrip('.')}"
 
-        if not extracted_title or any(bad in extracted_title.lower() for bad in bad_keywords):
-            extracted_title = clean_text_title if len(clean_text_title) > 3 else "Trending Deal Product"
-
-        # Layer C: Google/SERP Snippet Search Fallback for Price
-        if not extracted_price or "Check Link" in extracted_price:
-            serp_price = fetch_price_from_search_engine(extracted_title)
-            if serp_price:
-                extracted_price = serp_price
+        final_title = cleaned_title if len(cleaned_title) > 3 else "Featured Deal Product"
+        cross_platform_info = search_cross_platform_deals(final_title)
 
         return {
             "url": final_url, 
-            "title": extracted_title, 
-            "price": extracted_price if extracted_price else "Best Market Live Deal"
+            "title": final_title, 
+            "price": extracted_price if extracted_price else "Check Link",
+            "desc": extracted_desc,
+            "cross_platform": cross_platform_info
         }
     except Exception:
-        fallback = clean_text_title if len(clean_text_title) > 3 else "Featured Deal Product"
-        serp_price = fetch_price_from_search_engine(fallback)
+        clean_text = re.sub(r'https?://\S+', '', raw_user_text).strip()
+        final_title = clean_text if len(clean_text) > 3 else "Featured Deal Product"
+        cross_platform_info = search_cross_platform_deals(final_title)
         return {
             "url": url, 
-            "title": fallback, 
-            "price": serp_price if serp_price else "Best Market Live Deal"
+            "title": final_title, 
+            "price": "Check Link",
+            "desc": "",
+            "cross_platform": cross_platform_info
         }
 
 # 7. Multi-Key API Fallback System
@@ -181,8 +156,8 @@ async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
             completion = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=1024,
+                temperature=0.1,
+                max_tokens=512,
             )
             return completion.choices[0].message.content
         except Exception as e:
@@ -197,33 +172,39 @@ async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
                         pass
                 raise e
 
-# 8. AI Master Prompt Generator - PRASAD TECH STYLE & ZERO-HALLUCINATION
+# 8. AI Master Prompt Generator - PRASAD TECH FORMAT WITH CROSS PLATFORM LINE
 def build_master_prompt(user_input: str, scraped_info: dict, deal_type: str = "NORMAL") -> str:
-    badge_header = ""
-    if deal_type == "BYPASS":
-        badge_header = "🔥 **PREMIUM VERIFIED DEAL** 🤯"
-    elif deal_type == "SPONSORED":
-        badge_header = "📢 **SPONSORED SPECIAL PROMOTION** 🤩"
-    else:
-        badge_header = "🤯 **UNBELIEVABLE PRICE DROP ALERT** 😱"
-
     return f"""
-    You are a viral Tech Creator & Master AI Agent For Deals (style of Prasad Tech in Telugu).
-    Generate a high-converting, highly energetic English Telegram deal post based on:
-    - Verified Product Name: {scraped_info.get('title', '')}
-    - Real Live Price Tag: {scraped_info.get('price', 'Best Market Live Deal')}
-    - Buy Link: {scraped_info.get('url', '')}
+    You are an automated deal poster formatting strict, ultra-clean Telegram deals exactly like Prasad Tech in Telugu.
 
-    STRICT HIGH-CONVERTING DIRECTIVES:
-    1. HEADER BADGE: Start with {badge_header}
-    2. PRODUCT TITLE: Format in **Bold** with exciting Face Emojis and Product Emojis (e.g., 🤩, 🤯, 📱, 🎧, ⚡).
-    3. PRICE HOOK: Show the Live Price Tag clearly (e.g., "💰 **Deal Price:** {scraped_info.get('price', 'Best Market Live Deal')} 📉").
-       - CRITICAL: Do NOT put URLs in the price section!
-    4. HIGHLIGHTS: Provide 3 crisp, exciting bullet points using 🤩, 🔥, or ✅ based strictly on verified specs.
-    5. CALL TO ACTION (ONLY URL LOCATION): Output EXACTLY ONE buy link at the very end (e.g., "🛒 **Grab This Crazy Deal Now:** [Link]").
-       - NEVER repeat URLs elsewhere!
-    6. MASTER CATEGORY HASHTAGS: Pick 1 or 2 ACCURATE hashtags ONLY from this official list:
-       [#Automobile, #Electronics, #Fashion, #Furniture, #Home_Kitchen, #Beauty, #Health_PersonalCare, #Medical, #Grocery, #Toys_Games, #Sports_Fitness, #Baby_Kids, #Luggage_Travel, #Books_Stationery].
+    INPUT DATA:
+    - Product Title: {scraped_info.get('title', '')}
+    - Live Deal Price: {scraped_info.get('price', 'Check Link')}
+    - Cross Platform Prices: {scraped_info.get('cross_platform', 'Verified Best Price Across Stores')}
+    - Buy Link: {scraped_info.get('url', '')}
+    - Product Specs: {scraped_info.get('desc', '')}
+    - User Notes: {user_input}
+
+    STRICT OUTPUT TEMPLATE REQUIREMENTS:
+    Output ONLY the exact formatted structure below. NO intro, NO explanatory text!
+
+    FORMAT LAYOUT:
+    🔥🔥 [Full Product Title with Main Specs]
+
+    🎁 Deal Price : {scraped_info.get('price', 'Check Link')}
+
+    🔍 Cross Platform Price : {scraped_info.get('cross_platform', 'Verified Best Price Across Stores')}
+
+    Buy Here : {scraped_info.get('url', '')}
+
+    💥 Bank Offer : [Extract bank offer if present in specs/user notes, otherwise omit this entire line]
+
+    [#Category Hashtag from: #Electronics, #Fashion, #Furniture, #Home_Kitchen, #Beauty, #Health_PersonalCare, #Medical, #Grocery, #Toys_Games, #Sports_Fitness, #Baby_Kids, #Luggage_Travel, #Books_Stationery, #Automobile]
+
+    STRICT RULES:
+    1. Do NOT write extra sentences or fluff paragraphs.
+    2. Do NOT repeat URLs. The link appears EXACTLY ONCE under "Buy Here :".
+    3. Keep layout ultra-clean, minimal, and direct.
     """
 
 # 9. Telegram Bot Handlers
