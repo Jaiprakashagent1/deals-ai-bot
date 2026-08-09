@@ -1,4 +1,4 @@
-     import os
+            import os
 import re
 import json
 import sqlite3
@@ -6,6 +6,7 @@ import requests
 import http.server
 import socketserver
 import threading
+from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 from groq import Groq
 from telegram import Update
@@ -37,7 +38,6 @@ if not TELEGRAM_TOKEN:
 if not GROQ_API_KEY:
     raise SystemExit("CRITICAL ERROR: GROQ_API_KEY is not set in Environment Variables!")
 
-# Initialize Groq Client
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ def is_admin(user_id: int) -> bool:
     return str(user_id) == str(ADMIN_CHAT_ID)
 
 # ---------------------------------------------------------------------------
-# 5. Advanced Data Extraction Engine (Facebook ExternalHit Scraper)
+# 5. Advanced Data & Price Extraction Engine
 # ---------------------------------------------------------------------------
 JUNK_TITLE_PATTERN = re.compile(r'^[!\W]*[A-Za-z0-9]{8,}$')
 BRAND_SUFFIX_PATTERN = re.compile(
@@ -88,15 +88,46 @@ BRAND_SUFFIX_PATTERN = re.compile(
     flags=re.IGNORECASE
 )
 
-def clean_title(raw_title: str, raw_user_text: str) -> str:
+def extract_title_from_url_slug(url: str) -> str:
+    """Fallback: URL అడ్రస్ ఆధారంగా ప్రొడక్ట్ పేరును ఎక్స్‌ట్రాక్ట్ చేసే ఫంక్షన్."""
+    try:
+        path = unquote(urlparse(url).path)
+        parts = [p for p in path.split('/') if p]
+        for part in parts:
+            if part.lower() not in ['p', 's', 'dl', 'dp', 'gp'] and not part.startswith('itm') and len(part) > 5:
+                clean_name = re.sub(r'[-_]', ' ', part).title().strip()
+                if not any(x in clean_name.lower() for x in ['flipkart', 'amazon', 'myntra', 'buy', 'online']):
+                    return clean_name
+    except Exception:
+        pass
+    return ""
+
+def clean_title(raw_title: str, final_url: str, raw_user_text: str) -> str:
     title = (raw_title or "").strip()
     title = BRAND_SUFFIX_PATTERN.sub('', title).strip()
 
     if not title or JUNK_TITLE_PATTERN.match(title) or len(title) < 4:
+        title = extract_title_from_url_slug(final_url)
+
+    if not title:
         fallback = re.sub(r'https?://\S+', '', raw_user_text or "").strip()
         title = fallback if len(fallback) > 3 else ""
 
     return title if title else "Featured Deal Product"
+
+def extract_flipkart_price(html_text: str) -> str:
+    """Flipkart JS డేటా నుండి డిస్కౌంట్ ప్రైస్‌ను వెతికే స్మార్ట్ ఎక్స్‌ట్రాక్టర్."""
+    patterns = [
+        r'"finalPrice"\s*:\s*\{\s*"value"\s*:\s*(\d+)',
+        r'"minPrice"\s*:\s*(\d+)',
+        r'"pricing"\s*:\s*\{\s*"finalPrice"\s*:\s*(\d+)'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text)
+        if match:
+            val = int(match.group(1))
+            return f"₹{val:,}"
+    return ""
 
 def extract_price_from_jsonld(soup: BeautifulSoup):
     for script in soup.find_all("script", type="application/ld+json"):
@@ -115,7 +146,7 @@ def extract_price_from_jsonld(soup: BeautifulSoup):
 
 def extract_price_from_text(text: str) -> str:
     patterns = [
-        r'(?:Deal Price|Price)["\s:>]{1,15}(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d{1,2})?)',
+        r'(?:Deal Price|Special Price|Price)["\s:>]{1,15}(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d{1,2})?)',
         r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d{1,2})?)',
     ]
     for pattern in patterns:
@@ -126,7 +157,7 @@ def extract_price_from_text(text: str) -> str:
 
 def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
     headers = {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
@@ -134,7 +165,7 @@ def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
     final_url = url
     try:
         session = requests.Session()
-        res = session.get(url, headers=headers, timeout=8, allow_redirects=True)
+        res = session.get(url, headers=headers, timeout=10, allow_redirects=True)
         final_url = res.url
         soup = BeautifulSoup(res.text, "html.parser")
 
@@ -146,23 +177,28 @@ def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
         og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "twitter:description"})
         desc = og_desc["content"].strip() if og_desc and og_desc.get("content") else ""
 
-        meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
-        price = f"₹{meta_price['content'].strip()}" if meta_price and meta_price.get("content") else ""
+        # Price Extraction Hierarchy
+        price = extract_flipkart_price(res.text)
+        if not price:
+            meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
+            price = f"₹{meta_price['content'].strip()}" if meta_price and meta_price.get("content") else ""
         if not price:
             price = extract_price_from_jsonld(soup)
         if not price:
             price = extract_price_from_text(desc) or extract_price_from_text(res.text)
 
+        title = clean_title(raw_title, final_url, raw_user_text)
+
         return {
             "url": final_url,
-            "title": clean_title(raw_title, raw_user_text),
+            "title": title,
             "price": price if price else "Check Link",
             "desc": desc,
         }
     except Exception:
         return {
             "url": url,
-            "title": clean_title("", raw_user_text),
+            "title": clean_title("", url, raw_user_text),
             "price": "Check Link",
             "desc": "",
         }
@@ -207,8 +243,8 @@ Buy Here : {scraped_info.get('url', '')}
 
 STRICT RULES:
 1. The buy link appears EXACTLY ONCE, under "Buy Here :". Never repeat it.
-2. No fluff sentences. No text before 🔥🔥 or after the hashtag line.
-3. Pick exactly one category hashtag from the official list above - never invent a new one.
+2. No fluff sentences.
+3. Pick exactly one category hashtag from the official list above.
 """
 
 def call_groq_ai(prompt: str) -> str:
@@ -254,7 +290,7 @@ async def handle_deal_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         url_match = re.search(r'https?://\S+', raw_text)
         scraped = scrape_link_data(url_match.group(0), raw_user_text=raw_text) if url_match else {
-            "url": "", "title": clean_title("", raw_text), "price": "Check Link", "desc": ""
+            "url": "", "title": clean_title("", "", raw_text), "price": "Check Link", "desc": ""
         }
 
         prompt = build_master_prompt(raw_text, scraped, deal_type)
@@ -385,4 +421,3 @@ if __name__ == "__main__":
     app.job_queue.run_repeating(check_price_alerts, interval=PRICE_CHECK_MINUTES * 60, first=60)
 
     app.run_polling()
-   
