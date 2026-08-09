@@ -6,7 +6,7 @@ import requests
 import http.server
 import socketserver
 import threading
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from bs4 import BeautifulSoup
 from groq import Groq
 from telegram import Update
@@ -51,58 +51,88 @@ def is_admin(user_id: int) -> bool:
         return True
     return str(user_id) == str(ADMIN_CHAT_ID)
 
-# 5. Bulletproof Link Scraper & Title/Price Extractor
-def scrape_link_data(url: str) -> dict:
+# 5. Enterprise-Grade Multi-Platform Scraper Engine
+def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"'
     }
+
+    # Clean raw user message to form a robust fallback title
+    clean_text_title = raw_user_text
+    clean_text_title = re.sub(r'https?://\S+', '', clean_text_title)
+    clean_text_title = re.sub(r'(Take a look at this|on Flipkart|on Amazon|on Myntra|on Ajio|Check out)', '', clean_text_title, flags=re.IGNORECASE).strip()
+
+    extracted_title = ""
+    extracted_price = "Check Link for Live Price"
+
+    bad_keywords = [
+        "recaptcha", "captcha", "robot check", "access denied", 
+        "security check", "blocked", "cloudflare", "403 forbidden", 
+        "just a moment", "attention required"
+    ]
+
     try:
         session = requests.Session()
         res = session.get(url, headers=headers, timeout=8, allow_redirects=True)
         final_url = res.url
 
-        # A. Smart Title Extraction directly from Amazon / Flipkart URL Slug
-        extracted_title = ""
-        if "amazon" in final_url or "amzn" in final_url:
-            match = re.search(r'amazon\.in/([^/]+)/(?:dp|gp/product)/', final_url)
-            if match:
-                extracted_title = unquote(match.group(1)).replace('-', ' ').title()
-        elif "flipkart" in final_url:
-            match = re.search(r'flipkart\.com/([^/]+)/p/', final_url)
-            if match:
-                extracted_title = unquote(match.group(1)).replace('-', ' ').title()
+        # A. URL Slug Parsing (Amazon, Flipkart, Myntra, Ajio, Nykaa, Meesho, TataCLiQ)
+        parsed_path = urlparse(final_url).path
+        slug_parts = [p for p in parsed_path.split('/') if p and not p.isdigit() and len(p) > 3]
+        
+        if slug_parts:
+            candidate_slug = slug_parts[0]
+            if candidate_slug not in ['dp', 'gp', 'p', 'buy', 'product']:
+                extracted_title = unquote(candidate_slug).replace('-', ' ').replace('_', ' ').title()
 
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # Fallback to HTML Title if URL Slug fails
-        if not extracted_title or len(extracted_title) < 5:
-            if soup.title and "Amazon" not in soup.title.string and "Robot Check" not in soup.title.string:
-                extracted_title = soup.title.string.strip()
-            else:
-                extracted_title = "Featured Product Deal"
+        # B. Page Title Extraction with Strict Blacklist Filter
+        page_title = soup.title.string.strip() if soup.title else ""
+        if page_title and not any(bad in page_title.lower() for bad in bad_keywords):
+            # Remove site branding from title
+            cleaned_page_title = re.sub(r'\s*[\|-]\s*(Amazon|Flipkart|Myntra|Ajio|Nykaa|Meesho|Tata CLiQ).*', '', page_title, flags=re.IGNORECASE).strip()
+            if len(cleaned_page_title) > 5:
+                extracted_title = cleaned_page_title
 
-        # B. Real Live Price Extraction
-        extracted_price = "Check Link for Live Price"
+        # C. Price Extraction via Meta Tags & JSON-LD
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string if script.string else "")
+                if isinstance(data, list): data = data[0]
+                if isinstance(data, dict):
+                    offers = data.get("offers")
+                    if isinstance(offers, dict) and "price" in offers:
+                        extracted_price = f"₹{offers['price']}"
+                        break
+                    elif isinstance(offers, list) and len(offers) > 0 and "price" in offers[0]:
+                        extracted_price = f"₹{offers[0]['price']}"
+                        break
+            except Exception:
+                continue
 
-        # Try Meta tags (OpenGraph / Schema)
-        meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
-        if meta_price and meta_price.get("content"):
-            extracted_price = f"₹{meta_price['content'].strip()}"
-        else:
-            # Selector Fallbacks
-            price_elem = soup.find("span", class_="a-price-whole") or soup.find("span", id="priceblock_ourprice")
-            if price_elem:
-                extracted_price = f"₹{price_elem.text.strip().rstrip('.')}"
+        if extracted_price == "Check Link for Live Price":
+            meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
+            if meta_price and meta_price.get("content"):
+                extracted_price = f"₹{meta_price['content'].strip()}"
             else:
-                fk_price = soup.find("div", class_="_30jeq3") or soup.find("div", class_="Nx9q3U")
-                if fk_price:
-                    extracted_price = fk_price.text.strip()
+                price_elem = soup.find("span", class_="a-price-whole") or soup.find("div", class_="_30jeq3") or soup.find("div", class_="pdp-price") or soup.find("span", class_="pdp-price")
+                if price_elem:
+                    extracted_price = f"₹{price_elem.text.strip().rstrip('.')}"
+
+        # Fallback if title is still blacklisted or empty
+        if not extracted_title or any(bad in extracted_title.lower() for bad in bad_keywords):
+            extracted_title = clean_text_title if len(clean_text_title) > 3 else "Trending Tech / Fashion Deal"
 
         return {"url": final_url, "title": extracted_title, "price": extracted_price}
     except Exception:
-        return {"url": url, "title": "Featured Product Deal", "price": "Check Link for Live Price"}
+        fallback = clean_text_title if len(clean_text_title) > 3 else "Featured Deal Product"
+        return {"url": url, "title": fallback, "price": extracted_price}
 
 # 6. Multi-Key API Fallback System
 async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -132,35 +162,34 @@ async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
                         pass
                 raise e
 
-# 7. AI Master Prompt Generator - HIGHLY ATTRACTIVE & VIRAL TELEGRAM FORMATTING
+# 7. AI Master Prompt Generator - PRASAD TECH STYLE & FACE EMOJIS
 def build_master_prompt(user_input: str, scraped_info: dict, deal_type: str = "NORMAL") -> str:
     badge_header = ""
     if deal_type == "BYPASS":
-        badge_header = "🔥 **PREMIUM VERIFIED DEAL** 🔥"
+        badge_header = "🔥 **PREMIUM VERIFIED DEAL** 🤯"
     elif deal_type == "SPONSORED":
-        badge_header = "📢 **SPONSORED SPECIAL PROMOTION** 📢"
+        badge_header = "📢 **SPONSORED SPECIAL PROMOTION** 🤩"
     else:
-        badge_header = "🔥 **MEGA PRICE DROP ALERT** 💥"
+        badge_header = "🤯 **UNBELIEVABLE PRICE DROP ALERT** 😱"
 
     return f"""
-    You are the Master AI Agent For Deals creating viral, ultra-attractive Telegram deal posts.
-    Create a high-converting, heavily styled English Telegram post for:
-    - Verified Product Title: {scraped_info.get('title', '')}
+    You are a viral Tech Creator & Master AI Agent For Deals (in the style of Prasad Tech in Telugu).
+    Generate a high-converting, highly energetic, styled English Telegram deal post for:
+    - Product Name: {scraped_info.get('title', '')}
     - Live Price: {scraped_info.get('price', 'Check Link for Price')}
-    - Link: {scraped_info.get('url', '')}
+    - Product Link: {scraped_info.get('url', '')}
     - User Notes: {user_input}
 
     STRICT ATTRACTIVE FORMATTING RULES:
     1. HEADER BADGE: Start with {badge_header}
-    2. PRODUCT TITLE: Format in **Bold** with relevant emoji (e.g., 🎁, ⚡, 🎧, 📱, 💆‍♂️).
+    2. PRODUCT TITLE: Format in **Bold** with exciting Face Emojis and Product Emojis (e.g., 🤩, 🤯, 😱, 🤑, 😎, 📱, 🎧, 🎁, ⚡).
     3. PRICE SECTION:
-       - Show Deal Price clearly with 💥 or 📉 emojis.
-       - Include Bank/Card offer note if applicable.
-    4. HIGHLIGHTS: Provide 3 exciting, crisp bullet points using 🔥 or ✅ emojis.
-    5. CALL TO ACTION: Add an irresistible Buy Link button/CTA with 🛒 🎁 ⚡ emojis (e.g., "🛒 **Grab This Deal Now:** [Link]").
-    6. CATEGORY HASHTAGS: Pick 1 or 2 ACCURATE hashtags ONLY from this official list:
+       - Show Deal Price clearly with 💥, 📉, or 🤑 emojis.
+       - Highlight value for money.
+    4. HIGHLIGHTS: Provide 3 crisp, exciting, high-converting bullet points using 🤩, 🔥, or ✅ emojis based strictly on verified product details.
+    5. CALL TO ACTION: Add an irresistible Buy Link button/CTA with 🛒 🎁 ⚡ emojis (e.g., "🛒 **Grab This Crazy Deal Now:** [Link]").
+    6. MASTER CATEGORY HASHTAGS: Pick 1 or 2 ACCURATE hashtags ONLY from this official list:
        [#Automobile, #Electronics, #Fashion, #Furniture, #Home_Kitchen, #Beauty, #Health_PersonalCare, #Medical, #Grocery, #Toys_Games, #Sports_Fitness, #Baby_Kids, #Luggage_Travel, #Books_Stationery].
-       - CRITICAL: Massage guns / Grooming / Massagers MUST be tagged as #Health_PersonalCare or #Medical. Do NOT tag as #Home_Kitchen.
     """
 
 # 8. Telegram Bot Handlers
@@ -178,7 +207,7 @@ async def handle_deal_request(update: Update, context: ContextTypes.DEFAULT_TYPE
         url_match = re.search(r'https?://\S+', raw_text)
         scraped = {}
         if url_match:
-            scraped = scrape_link_data(url_match.group(0))
+            scraped = scrape_link_data(url_match.group(0), raw_user_text=raw_text)
         
         prompt = build_master_prompt(raw_text, scraped, deal_type)
         ai_response = await call_groq_ai(prompt, context)
