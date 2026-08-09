@@ -6,7 +6,7 @@ import requests
 import http.server
 import socketserver
 import threading
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, quote
 from bs4 import BeautifulSoup
 from groq import Groq
 from telegram import Update
@@ -51,90 +51,125 @@ def is_admin(user_id: int) -> bool:
         return True
     return str(user_id) == str(ADMIN_CHAT_ID)
 
-# 5. Enterprise-Grade Multi-Platform Scraper Engine
+# 5. GOOGLE/SERP STYLE SEARCH SNIPPET PRICE EXTRACTION ENGINE
+def fetch_price_from_search_engine(product_title: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    try:
+        # Querying live search indexing for direct price snippet
+        clean_query = re.sub(r'[^a-zA-Z0-9\s]', '', product_title)[:60]
+        search_url = f"https://html.duckduckgo.com/html/?q={quote(clean_query + ' price india amazon flipkart')}"
+        res = requests.get(search_url, headers=headers, timeout=6)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        snippets = []
+        for result in soup.find_all('a', class_='result__snippet')[:5]:
+            snippets.append(result.text.strip())
+            
+        combined_text = " ".join(snippets)
+        # Extract rupees patterns indexed by search engines
+        prices = re.findall(r'(?:₹|Rs\.?|INR)\s*([\d,]+)', combined_text, flags=re.IGNORECASE)
+        valid_prices = [p for p in prices if len(p.replace(',', '')) >= 3]
+        
+        if valid_prices:
+            return f"₹{valid_prices[0]}"
+        return ""
+    except Exception:
+        return ""
+
+# 6. Multi-Layer Enterprise Scraper Engine
 def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"'
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
     }
 
-    # Clean raw user message to form a robust fallback title
-    clean_text_title = raw_user_text
-    clean_text_title = re.sub(r'https?://\S+', '', clean_text_title)
+    # Layer A: Check Raw User Input for explicit price
+    user_price_match = re.search(r'(?:₹|Rs\.?|price)?\s*([\d,]{3,7})', raw_user_text, flags=re.IGNORECASE)
+    manual_price = f"₹{user_price_match.group(1)}" if user_price_match and len(user_price_match.group(1)) >= 3 else ""
+
+    clean_text_title = re.sub(r'https?://\S+', '', raw_user_text)
     clean_text_title = re.sub(r'(Take a look at this|on Flipkart|on Amazon|on Myntra|on Ajio|Check out)', '', clean_text_title, flags=re.IGNORECASE).strip()
 
     extracted_title = ""
-    extracted_price = "Check Link for Live Price"
+    extracted_price = manual_price
 
-    bad_keywords = [
-        "recaptcha", "captcha", "robot check", "access denied", 
-        "security check", "blocked", "cloudflare", "403 forbidden", 
-        "just a moment", "attention required"
-    ]
+    bad_keywords = ["recaptcha", "captcha", "robot check", "access denied", "security check", "blocked", "cloudflare"]
 
     try:
         session = requests.Session()
         res = session.get(url, headers=headers, timeout=8, allow_redirects=True)
         final_url = res.url
 
-        # A. URL Slug Parsing (Amazon, Flipkart, Myntra, Ajio, Nykaa, Meesho, TataCLiQ)
+        # URL Slug Extraction
         parsed_path = urlparse(final_url).path
         slug_parts = [p for p in parsed_path.split('/') if p and not p.isdigit() and len(p) > 3]
-        
         if slug_parts:
             candidate_slug = slug_parts[0]
-            if candidate_slug not in ['dp', 'gp', 'p', 'buy', 'product']:
+            if candidate_slug not in ['dp', 'gp', 'p', 'buy', 'product', 'dl']:
                 extracted_title = unquote(candidate_slug).replace('-', ' ').replace('_', ' ').title()
 
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # B. Page Title Extraction with Strict Blacklist Filter
+        # Page Title Extraction
         page_title = soup.title.string.strip() if soup.title else ""
         if page_title and not any(bad in page_title.lower() for bad in bad_keywords):
-            # Remove site branding from title
-            cleaned_page_title = re.sub(r'\s*[\|-]\s*(Amazon|Flipkart|Myntra|Ajio|Nykaa|Meesho|Tata CLiQ).*', '', page_title, flags=re.IGNORECASE).strip()
+            cleaned_page_title = re.sub(r'\s*[\|-]\s*(Amazon|Flipkart|Myntra|Ajio|Nykaa|Meesho).*', '', page_title, flags=re.IGNORECASE).strip()
             if len(cleaned_page_title) > 5:
                 extracted_title = cleaned_page_title
 
-        # C. Price Extraction via Meta Tags & JSON-LD
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string if script.string else "")
-                if isinstance(data, list): data = data[0]
-                if isinstance(data, dict):
-                    offers = data.get("offers")
-                    if isinstance(offers, dict) and "price" in offers:
-                        extracted_price = f"₹{offers['price']}"
-                        break
-                    elif isinstance(offers, list) and len(offers) > 0 and "price" in offers[0]:
-                        extracted_price = f"₹{offers[0]['price']}"
-                        break
-            except Exception:
-                continue
+        # Layer B: Direct Scraping Price Extraction
+        if not extracted_price:
+            for script in soup.find_all("script", type="application/ld+json"):
+                try:
+                    data = json.loads(script.string if script.string else "")
+                    if isinstance(data, list): data = data[0]
+                    if isinstance(data, dict):
+                        offers = data.get("offers")
+                        if isinstance(offers, dict) and "price" in offers:
+                            extracted_price = f"₹{offers['price']}"
+                            break
+                        elif isinstance(offers, list) and len(offers) > 0 and "price" in offers[0]:
+                            extracted_price = f"₹{offers[0]['price']}"
+                            break
+                except Exception:
+                    continue
 
-        if extracted_price == "Check Link for Live Price":
+        if not extracted_price:
             meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
             if meta_price and meta_price.get("content"):
                 extracted_price = f"₹{meta_price['content'].strip()}"
             else:
-                price_elem = soup.find("span", class_="a-price-whole") or soup.find("div", class_="_30jeq3") or soup.find("div", class_="pdp-price") or soup.find("span", class_="pdp-price")
+                price_elem = soup.find("span", class_="a-price-whole") or soup.find("div", class_="_30jeq3") or soup.find("div", class_="Nx9q3U")
                 if price_elem:
                     extracted_price = f"₹{price_elem.text.strip().rstrip('.')}"
 
-        # Fallback if title is still blacklisted or empty
         if not extracted_title or any(bad in extracted_title.lower() for bad in bad_keywords):
-            extracted_title = clean_text_title if len(clean_text_title) > 3 else "Trending Tech / Fashion Deal"
+            extracted_title = clean_text_title if len(clean_text_title) > 3 else "Trending Deal Product"
 
-        return {"url": final_url, "title": extracted_title, "price": extracted_price}
+        # Layer C: Google/SERP Snippet Search Fallback for Price
+        if not extracted_price or "Check Link" in extracted_price:
+            serp_price = fetch_price_from_search_engine(extracted_title)
+            if serp_price:
+                extracted_price = serp_price
+
+        return {
+            "url": final_url, 
+            "title": extracted_title, 
+            "price": extracted_price if extracted_price else "Best Market Live Deal"
+        }
     except Exception:
         fallback = clean_text_title if len(clean_text_title) > 3 else "Featured Deal Product"
-        return {"url": url, "title": fallback, "price": extracted_price}
+        serp_price = fetch_price_from_search_engine(fallback)
+        return {
+            "url": url, 
+            "title": fallback, 
+            "price": serp_price if serp_price else "Best Market Live Deal"
+        }
 
-# 6. Multi-Key API Fallback System
+# 7. Multi-Key API Fallback System
 async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
     keys = [k for k in [GROQ_API_KEY_1, GROQ_API_KEY_2] if k]
     if not keys:
@@ -162,7 +197,7 @@ async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
                         pass
                 raise e
 
-# 7. AI Master Prompt Generator - PRASAD TECH STYLE & FACE EMOJIS
+# 8. AI Master Prompt Generator - PRASAD TECH STYLE & ZERO-HALLUCINATION
 def build_master_prompt(user_input: str, scraped_info: dict, deal_type: str = "NORMAL") -> str:
     badge_header = ""
     if deal_type == "BYPASS":
@@ -173,26 +208,25 @@ def build_master_prompt(user_input: str, scraped_info: dict, deal_type: str = "N
         badge_header = "🤯 **UNBELIEVABLE PRICE DROP ALERT** 😱"
 
     return f"""
-    You are a viral Tech Creator & Master AI Agent For Deals (in the style of Prasad Tech in Telugu).
-    Generate a high-converting, highly energetic, styled English Telegram deal post for:
-    - Product Name: {scraped_info.get('title', '')}
-    - Live Price: {scraped_info.get('price', 'Check Link for Price')}
-    - Product Link: {scraped_info.get('url', '')}
-    - User Notes: {user_input}
+    You are a viral Tech Creator & Master AI Agent For Deals (style of Prasad Tech in Telugu).
+    Generate a high-converting, highly energetic English Telegram deal post based on:
+    - Verified Product Name: {scraped_info.get('title', '')}
+    - Real Live Price Tag: {scraped_info.get('price', 'Best Market Live Deal')}
+    - Buy Link: {scraped_info.get('url', '')}
 
-    STRICT ATTRACTIVE FORMATTING RULES:
+    STRICT HIGH-CONVERTING DIRECTIVES:
     1. HEADER BADGE: Start with {badge_header}
-    2. PRODUCT TITLE: Format in **Bold** with exciting Face Emojis and Product Emojis (e.g., 🤩, 🤯, 😱, 🤑, 😎, 📱, 🎧, 🎁, ⚡).
-    3. PRICE SECTION:
-       - Show Deal Price clearly with 💥, 📉, or 🤑 emojis.
-       - Highlight value for money.
-    4. HIGHLIGHTS: Provide 3 crisp, exciting, high-converting bullet points using 🤩, 🔥, or ✅ emojis based strictly on verified product details.
-    5. CALL TO ACTION: Add an irresistible Buy Link button/CTA with 🛒 🎁 ⚡ emojis (e.g., "🛒 **Grab This Crazy Deal Now:** [Link]").
+    2. PRODUCT TITLE: Format in **Bold** with exciting Face Emojis and Product Emojis (e.g., 🤩, 🤯, 📱, 🎧, ⚡).
+    3. PRICE HOOK: Show the Live Price Tag clearly (e.g., "💰 **Deal Price:** {scraped_info.get('price', 'Best Market Live Deal')} 📉").
+       - CRITICAL: Do NOT put URLs in the price section!
+    4. HIGHLIGHTS: Provide 3 crisp, exciting bullet points using 🤩, 🔥, or ✅ based strictly on verified specs.
+    5. CALL TO ACTION (ONLY URL LOCATION): Output EXACTLY ONE buy link at the very end (e.g., "🛒 **Grab This Crazy Deal Now:** [Link]").
+       - NEVER repeat URLs elsewhere!
     6. MASTER CATEGORY HASHTAGS: Pick 1 or 2 ACCURATE hashtags ONLY from this official list:
        [#Automobile, #Electronics, #Fashion, #Furniture, #Home_Kitchen, #Beauty, #Health_PersonalCare, #Medical, #Grocery, #Toys_Games, #Sports_Fitness, #Baby_Kids, #Luggage_Travel, #Books_Stationery].
     """
 
-# 8. Telegram Bot Handlers
+# 9. Telegram Bot Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 **AI Agent For Deals is Active!**\n\n"
