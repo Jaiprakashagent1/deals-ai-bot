@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(( "", port), handler) as httpd:
+    with socketserver.TCPServer(("", port), handler) as httpd:
         httpd.serve_forever()
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
@@ -18,8 +18,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 genai.configure(api_key=GEMINI_API_KEY)
-# మోడల్ పేరును gemini-1.5-flash గా మార్చడం జరిగింది
-model = genai.GenerativeModel('gemini-1.5-flash')
+# మోడల్ పేరును తిరిగి gemini-pro కి మారుస్తున్నాము
+model = genai.GenerativeModel('gemini-pro')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("AI Deals Bot is Active! Send me product details or links.")
