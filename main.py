@@ -6,6 +6,7 @@ import requests
 import http.server
 import socketserver
 import threading
+from urllib.parse import unquote
 from bs4 import BeautifulSoup
 from groq import Groq
 from telegram import Update
@@ -50,71 +51,60 @@ def is_admin(user_id: int) -> bool:
         return True
     return str(user_id) == str(ADMIN_CHAT_ID)
 
-# 5. Universal E-Commerce Price & Metadata Scraper (Amazon, Flipkart, Myntra, Ajio, Meesho, Nykaa)
+# 5. Bulletproof Link Scraper & Title/Price Extractor
 def scrape_link_data(url: str) -> dict:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
     }
     try:
-        res = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
+        session = requests.Session()
+        res = session.get(url, headers=headers, timeout=8, allow_redirects=True)
+        final_url = res.url
+
+        # A. Smart Title Extraction directly from Amazon / Flipkart URL Slug
+        extracted_title = ""
+        if "amazon" in final_url or "amzn" in final_url:
+            match = re.search(r'amazon\.in/([^/]+)/(?:dp|gp/product)/', final_url)
+            if match:
+                extracted_title = unquote(match.group(1)).replace('-', ' ').title()
+        elif "flipkart" in final_url:
+            match = re.search(r'flipkart\.com/([^/]+)/p/', final_url)
+            if match:
+                extracted_title = unquote(match.group(1)).replace('-', ' ').title()
+
         soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # Extract Product Title
-        title = soup.title.string.strip() if soup.title else "Deal Product"
-        
-        extracted_price = "Not Found"
-        
-        # Method A: JSON-LD Structured Data Parsing (Most Reliable across Stores)
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string if script.string else "")
-                if isinstance(data, list):
-                    data = data[0]
-                if isinstance(data, dict):
-                    offers = data.get("offers")
-                    if isinstance(offers, dict) and "price" in offers:
-                        extracted_price = str(offers["price"])
-                        break
-                    elif isinstance(offers, list) and len(offers) > 0 and "price" in offers[0]:
-                        extracted_price = str(offers[0]["price"])
-                        break
-            except Exception:
-                continue
 
-        # Method B: OpenGraph & Product Meta Tags (Ajio, Nykaa, Flipkart, Myntra)
-        if extracted_price == "Not Found":
-            meta_price = (
-                soup.find("meta", property="product:price:amount") or 
-                soup.find("meta", property="og:price:amount") or 
-                soup.find("meta", name="twitter:data1")
-            )
-            if meta_price and meta_price.get("content"):
-                extracted_price = meta_price["content"].strip()
-
-        # Method C: Site-Specific CSS Selectors Fallback
-        if extracted_price == "Not Found":
-            # Amazon Selectors
-            price_elem = soup.find("span", class_="a-price-whole") or soup.find("span", id="priceblock_ourprice") or soup.find("span", class_="a-offscreen")
-            if price_elem:
-                extracted_price = price_elem.text.strip()
+        # Fallback to HTML Title if URL Slug fails
+        if not extracted_title or len(extracted_title) < 5:
+            if soup.title and "Amazon" not in soup.title.string and "Robot Check" not in soup.title.string:
+                extracted_title = soup.title.string.strip()
             else:
-                # Flipkart / Meesho Selectors
-                fk_price = soup.find("div", class_="_30jeq3") or soup.find("div", class_="Nx9q3U") or soup.find("h8", class_="iBAtLg")
+                extracted_title = "Featured Product Deal"
+
+        # B. Real Live Price Extraction
+        extracted_price = "Check Link for Live Price"
+
+        # Try Meta tags (OpenGraph / Schema)
+        meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
+        if meta_price and meta_price.get("content"):
+            extracted_price = f"₹{meta_price['content'].strip()}"
+        else:
+            # Selector Fallbacks
+            price_elem = soup.find("span", class_="a-price-whole") or soup.find("span", id="priceblock_ourprice")
+            if price_elem:
+                extracted_price = f"₹{price_elem.text.strip().rstrip('.')}"
+            else:
+                fk_price = soup.find("div", class_="_30jeq3") or soup.find("div", class_="Nx9q3U")
                 if fk_price:
                     extracted_price = fk_price.text.strip()
-                else:
-                    # Ajio / Nykaa Selectors
-                    fashion_price = soup.find("div", class_="prod-sp") or soup.find("span", class_="css-1jcz222")
-                    if fashion_price:
-                        extracted_price = fashion_price.text.strip()
 
-        return {"url": res.url, "title": title, "price": extracted_price}
+        return {"url": final_url, "title": extracted_title, "price": extracted_price}
     except Exception:
-        return {"url": url, "title": "Deal Product", "price": "Not Found"}
+        return {"url": url, "title": "Featured Product Deal", "price": "Check Link for Live Price"}
 
-# 6. Multi-Key API Fallback & Critical Admin Alert System
+# 6. Multi-Key API Fallback System
 async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
     keys = [k for k in [GROQ_API_KEY_1, GROQ_API_KEY_2] if k]
     if not keys:
@@ -126,7 +116,7 @@ async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
             completion = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1, # Lowest temperature for absolute factual accuracy & Zero Hallucination
+                temperature=0.3,
                 max_tokens=1024,
             )
             return completion.choices[0].message.content
@@ -142,40 +132,38 @@ async def call_groq_ai(prompt: str, context: ContextTypes.DEFAULT_TYPE) -> str:
                         pass
                 raise e
 
-# 7. AI Master Prompt Generator with ZERO Hallucination & 14 Master Categories
+# 7. AI Master Prompt Generator - HIGHLY ATTRACTIVE & VIRAL TELEGRAM FORMATTING
 def build_master_prompt(user_input: str, scraped_info: dict, deal_type: str = "NORMAL") -> str:
-    badge_rule = ""
+    badge_header = ""
     if deal_type == "BYPASS":
-        badge_rule = "Include Badge: '🔥 PREMIUM VERIFIED DEAL'"
+        badge_header = "🔥 **PREMIUM VERIFIED DEAL** 🔥"
     elif deal_type == "SPONSORED":
-        badge_rule = "Include Badge: '📢 SPONSORED PROMOTION'"
+        badge_header = "📢 **SPONSORED SPECIAL PROMOTION** 📢"
     else:
-        badge_rule = "Include dynamic smart badges like '📉 PRICE DROPPED!' or '⚡ FLASH DEAL' if discount is clear."
+        badge_header = "🔥 **MEGA PRICE DROP ALERT** 💥"
 
     return f"""
-    You are the Master AI Agent For Deals.
-    Generate a high-converting, clean, professional English Telegram deal post based on:
-    - Raw User Input: {user_input}
-    - Scraped Product Title: {scraped_info.get('title', '')}
-    - Scraped Live Price: {scraped_info.get('price', 'Not Found')}
-    - Product Link: {scraped_info.get('url', '')}
+    You are the Master AI Agent For Deals creating viral, ultra-attractive Telegram deal posts.
+    Create a high-converting, heavily styled English Telegram post for:
+    - Verified Product Title: {scraped_info.get('title', '')}
+    - Live Price: {scraped_info.get('price', 'Check Link for Price')}
+    - Link: {scraped_info.get('url', '')}
+    - User Notes: {user_input}
 
-    STRICT ZERO-HALLUCINATION DIRECTIVES:
-    1. NEVER INVENT OR GUESS DATA: Do NOT fabricate unverified MRPs, fake discount percentages, fake bank offers, or unverified technical specs. Use ONLY real facts present in the input or scraped price data.
-    2. STRICT PRICE COMPARISON RULE: Display the official Live Deal Price based on scraped data. NEVER fabricate competitor prices across stores (e.g., Do NOT invent fake prices for Ajio, Flipkart, Meesho, or Nykaa unless exact scraped price data is provided).
-    3. {badge_rule}
-    4. Format Product Title clearly in **Bold**.
-    5. Provide 3 crisp, strictly accurate Bullet Highlights based ONLY on verified product details.
-    6. OFFICIAL 14 MASTER CATEGORIES: Select ONLY 1 or 2 most accurate hashtags strictly from this exact list:
+    STRICT ATTRACTIVE FORMATTING RULES:
+    1. HEADER BADGE: Start with {badge_header}
+    2. PRODUCT TITLE: Format in **Bold** with relevant emoji (e.g., 🎁, ⚡, 🎧, 📱, 💆‍♂️).
+    3. PRICE SECTION:
+       - Show Deal Price clearly with 💥 or 📉 emojis.
+       - Include Bank/Card offer note if applicable.
+    4. HIGHLIGHTS: Provide 3 exciting, crisp bullet points using 🔥 or ✅ emojis.
+    5. CALL TO ACTION: Add an irresistible Buy Link button/CTA with 🛒 🎁 ⚡ emojis (e.g., "🛒 **Grab This Deal Now:** [Link]").
+    6. CATEGORY HASHTAGS: Pick 1 or 2 ACCURATE hashtags ONLY from this official list:
        [#Automobile, #Electronics, #Fashion, #Furniture, #Home_Kitchen, #Beauty, #Health_PersonalCare, #Medical, #Grocery, #Toys_Games, #Sports_Fitness, #Baby_Kids, #Luggage_Travel, #Books_Stationery].
-       - Example 1: Bike/Car accessories or helmets = #Automobile
-       - Example 2: Kids toys/RC cars = #Toys_Games
-       - Example 3: Travel bags/Luggage = #Luggage_Travel
-       - Example 4: Grooming/Massage guns = #Health_PersonalCare or #Medical
-    7. Clear Call-To-Action (CTA) link with clean layout and relevant emojis.
+       - CRITICAL: Massage guns / Grooming / Massagers MUST be tagged as #Health_PersonalCare or #Medical. Do NOT tag as #Home_Kitchen.
     """
 
-# 8. Telegram Bot Command & Message Handlers
+# 8. Telegram Bot Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 **AI Agent For Deals is Active!**\n\n"
