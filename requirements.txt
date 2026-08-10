@@ -1,4 +1,4 @@
 groq
-python-telegram-bot[job-queue]==20.8
+python-telegram-bot[job-queue]>=21.4
 requests
 beautifulsoup4
