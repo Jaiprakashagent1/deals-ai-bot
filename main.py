@@ -3,481 +3,318 @@ import re
 import json
 import sqlite3
 import requests
+import threading
 import http.server
 import socketserver
-import threading
 from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 from groq import Groq
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ---------------------------------------------------------------------------
-# 1. Dummy HTTP Server for Render Cloud Platform (Keeps Service Alive)
-# ---------------------------------------------------------------------------
-def run_dummy_server():
+# ==============================================================================
+# 1. CLOUD SERVER KEEP-ALIVE (Render Web Service Support)
+# ==============================================================================
+def run_health_server():
+    """Starts a dummy HTTP server so Render doesn't shut down the bot."""
     port = int(os.environ.get("PORT", 10000))
     handler = http.server.SimpleHTTPRequestHandler
     with socketserver.TCPServer(("", port), handler) as httpd:
         httpd.serve_forever()
 
-threading.Thread(target=run_dummy_server, daemon=True).start()
+threading.Thread(target=run_health_server, daemon=True).start()
 
-# ---------------------------------------------------------------------------
-# 2. Environment Variables Retrieval
-# ---------------------------------------------------------------------------
-TELEGRAM_TOKEN       = os.environ.get("TELEGRAM_TOKEN", "").strip()
-GROQ_API_KEY         = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_API_KEY_BACKUP  = os.environ.get("GROQ_API_KEY_BACKUP", "").strip()
-ADMIN_CHAT_ID        = os.environ.get("ADMIN_CHAT_ID", "").strip()
-CHANNEL_ID           = os.environ.get("CHANNEL_ID", "").strip()
-DB_PATH              = os.environ.get("DB_PATH", "deals_bot.db").strip()
-PRICE_CHECK_MINUTES  = int(os.environ.get("PRICE_CHECK_MINUTES", "60"))
+# ==============================================================================
+# 2. ENVIRONMENT VARIABLES & CONFIGURATION
+# ==============================================================================
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN", "").strip()
+GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_API_KEY_BACKUP = os.environ.get("GROQ_API_KEY_BACKUP", "").strip()
+ADMIN_CHAT_ID       = os.environ.get("ADMIN_CHAT_ID", "").strip()
+CHANNEL_ID          = os.environ.get("CHANNEL_ID", "").strip()
+DB_PATH             = os.environ.get("DB_PATH", "deals_bot.db").strip()
+PRICE_CHECK_MINUTES = int(os.environ.get("PRICE_CHECK_MINUTES", "60"))
 
-if not TELEGRAM_TOKEN:
-    raise SystemExit("CRITICAL ERROR: TELEGRAM_TOKEN is not set in Environment Variables!")
-if not GROQ_API_KEY:
-    raise SystemExit("CRITICAL ERROR: GROQ_API_KEY is not set in Environment Variables!")
+if not TELEGRAM_TOKEN or not GROQ_API_KEY:
+    raise SystemExit("❌ CRITICAL ERROR: TELEGRAM_TOKEN or GROQ_API_KEY is missing!")
 
-groq_client = Groq(api_key=GROQ_API_KEY)
-groq_client_backup = Groq(api_key=GROQ_API_KEY_BACKUP) if GROQ_API_KEY_BACKUP else None
+# Initialize AI Clients
+primary_ai = Groq(api_key=GROQ_API_KEY)
+backup_ai  = Groq(api_key=GROQ_API_KEY_BACKUP) if GROQ_API_KEY_BACKUP else None
 
-# ---------------------------------------------------------------------------
-# 3. Official 14 Categories List
-# ---------------------------------------------------------------------------
+# The 14 Official Categories
 CATEGORIES = [
     "#Automobile", "#Electronics", "#Fashion", "#Furniture", "#Home_Kitchen",
     "#Beauty", "#Health_PersonalCare", "#Medical", "#Grocery", "#Toys_Games",
-    "#Sports_Fitness", "#Baby_Kids", "#Luggage_Travel", "#Books_Stationery",
+    "#Sports_Fitness", "#Baby_Kids", "#Luggage_Travel", "#Books_Stationery"
 ]
 
-# ---------------------------------------------------------------------------
-# 4. SQLite Database Engine (Price Drop Tracking)
-# ---------------------------------------------------------------------------
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ==============================================================================
+# 3. DATABASE MODULE (SQLite for Price Tracking)
+# ==============================================================================
+def setup_database():
+    """Initializes the database table for tracking price drops."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS price_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_link TEXT NOT NULL,
+                target_price REAL NOT NULL,
+                status TEXT DEFAULT 'ACTIVE',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
-def init_db():
-    conn = get_conn()
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS price_alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            product_link TEXT NOT NULL,
-            target_price REAL NOT NULL,
-            status TEXT DEFAULT 'ACTIVE',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+setup_database()
 
-init_db()
-
-def is_admin(user_id: int) -> bool:
-    if not ADMIN_CHAT_ID:
-        return True
-    return str(user_id) == str(ADMIN_CHAT_ID)
-
-# ---------------------------------------------------------------------------
-# 5. Advanced Data & Price Extraction Engine
-# ---------------------------------------------------------------------------
-JUNK_TITLE_PATTERN = re.compile(r'^[!\W]*[A-Za-z0-9]{8,}$')
-BRAND_SUFFIX_PATTERN = re.compile(
-    r'\s*[\|\-–]\s*(Amazon(\.in)?|Flipkart|Myntra|Ajio|Nykaa|Meesho|Tata\s*CLiQ).*',
-    flags=re.IGNORECASE
-)
-
-def expand_short_url(url: str) -> str:
-    """Flipkart/Amazon షార్ట్ లింక్స్‌ని ఫుల్ ఒరిజినల్ URL గా మార్చే లాజిక్."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
+# ==============================================================================
+# 4. ADVANCED SCRAPING & DATA EXTRACTION ENGINE
+# ==============================================================================
+def resolve_final_url(url: str) -> str:
+    """Expands short URLs (like dl.flipkart.com) to their full original URLs."""
     try:
-        res = requests.head(url, headers=headers, allow_redirects=True, timeout=5)
+        res = requests.head(url, allow_redirects=True, timeout=5)
         if res.url and res.url != url:
             return res.url
-    except Exception:
-        pass
-    try:
-        res = requests.get(url, headers=headers, allow_redirects=True, timeout=5, stream=True)
+        res = requests.get(url, allow_redirects=True, timeout=5, stream=True)
         return res.url
     except Exception:
         return url
 
-def parse_app_share_text(raw_text: str) -> tuple:
-    title = ""
-    price = ""
-    raw_text = raw_text or ""
+def extract_share_text_details(raw_text: str) -> tuple[str, str]:
+    """Extracts product name and price if the user forwards a message from an app."""
+    title, price = "", ""
+    if not raw_text: return title, price
 
-    fk_match = re.search(r'Take a look at this\s+(.*?)\s+on Flipkart', raw_text, flags=re.IGNORECASE)
+    # Find Flipkart specific share format
+    fk_match = re.search(r'Take a look at this\s+(.*?)\s+on Flipkart', raw_text, re.IGNORECASE)
     if fk_match:
         title = fk_match.group(1).strip()
+    else:
+        # Generic match for any text before the URL
+        generic_match = re.match(r'^(.*?)\s*https?://\S+', raw_text.strip(), re.IGNORECASE | re.DOTALL)
+        if generic_match and len(generic_match.group(1).strip()) > 3:
+            title = generic_match.group(1).strip()
 
-    if not title:
-        generic_match = re.match(r'^(.*?)\s*https?://\S+', raw_text.strip(), flags=re.IGNORECASE | re.DOTALL)
-        if generic_match:
-            candidate = generic_match.group(1).strip()
-            if len(candidate) > 3 and 'http' not in candidate.lower():
-                title = candidate
-
-    price_match = re.search(r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d{1,2})?)', raw_text, flags=re.IGNORECASE)
+    # Find Price in text
+    price_match = re.search(r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d{1,2})?)', raw_text, re.IGNORECASE)
     if price_match:
         price = f"₹{price_match.group(1)}"
 
     return title, price
 
-def extract_title_from_url_slug(url: str) -> str:
-    try:
-        path = unquote(urlparse(url).path)
-        parts = [p for p in path.split('/') if p]
-        for part in parts:
-            if part.lower() not in ['p', 's', 'dl', 'dp', 'gp'] and not part.startswith('itm') and len(part) > 5:
-                clean_name = re.sub(r'[-_]', ' ', part).title().strip()
-                if not any(x in clean_name.lower() for x in ['flipkart', 'amazon', 'myntra', 'buy', 'online']):
-                    return clean_name
-    except Exception:
-        pass
-    return ""
-
-def clean_title(raw_title: str, final_url: str, raw_user_text: str) -> str:
-    share_title, _ = parse_app_share_text(raw_user_text)
-    if share_title:
-        return share_title
-
-    title = (raw_title or "").strip()
-    title = BRAND_SUFFIX_PATTERN.sub('', title).strip()
-
-    if not title or JUNK_TITLE_PATTERN.match(title) or len(title) < 4:
-        title = extract_title_from_url_slug(final_url)
-
-    if not title:
-        fallback = re.sub(r'https?://\S+', '', raw_user_text or "").strip()
-        title = fallback if len(fallback) > 3 else ""
-
-    return title if title else "Featured Deal Product"
-
-def extract_flipkart_price(html_text: str) -> str:
-    patterns = [
-        r'"finalPrice"\s*:\s*\{\s*"value"\s*:\s*(\d+)',
-        r'"minPrice"\s*:\s*(\d+)',
-        r'"pricing"\s*:\s*\{\s*"finalPrice"\s*:\s*(\d+)'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, html_text)
-        if match:
-            val = int(match.group(1))
-            return f"₹{val:,}"
-    return ""
-
-def extract_price_from_jsonld(soup: BeautifulSoup):
+def get_live_price(html: str, soup: BeautifulSoup) -> str:
+    """Multi-layered approach to find the accurate live deal price."""
+    # 1. Check Flipkart JS Data
+    for pattern in [r'"finalPrice"\s*:\s*\{\s*"value"\s*:\s*(\d+)', r'"minPrice"\s*:\s*(\d+)']:
+        match = re.search(pattern, html)
+        if match: return f"₹{int(match.group(1)):,}"
+    
+    # 2. Check Meta Tags
+    meta = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
+    if meta and meta.get("content"): return f"₹{meta['content'].strip()}"
+    
+    # 3. Check JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "{}")
-        except (json.JSONDecodeError, TypeError):
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                offers = item.get("offers", {})
+                if isinstance(offers, list): offers = offers[0]
+                if isinstance(offers, dict) and offers.get("price"):
+                    return f"₹{offers['price']}"
+        except Exception:
             continue
-        candidates = data if isinstance(data, list) else [data]
-        for item in candidates:
-            offers = item.get("offers") if isinstance(item, dict) else None
-            if isinstance(offers, list):
-                offers = offers[0] if offers else None
-            if isinstance(offers, dict) and offers.get("price"):
-                return f"₹{offers['price']}"
+            
     return ""
 
-def extract_price_from_text(text: str) -> str:
-    patterns = [
-        r'(?:Deal Price|Special Price|Price)["\s:>]{1,15}(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d{1,2})?)',
-        r'(?:Rs\.?|₹|INR)\s*([\d,]+(?:\.\d{1,2})?)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text or "", flags=re.IGNORECASE)
-        if match:
-            return f"₹{match.group(1)}"
-    return ""
-
-def scrape_link_data(url: str, raw_user_text: str = "") -> dict:
+def scrape_product_info(url: str, user_message: str) -> dict:
+    """Master function to gather all product details safely."""
+    share_title, share_price = extract_share_text_details(user_message)
+    final_url = resolve_final_url(url)
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9"
     }
-
-    # Step 1: Expand short URL first
-    final_url = expand_short_url(url)
     
-    _, text_price = parse_app_share_text(raw_user_text)
-    raw_title = ""
-    desc = ""
-    price = text_price
-
-    # Step 2: Extract HTML details
     try:
-        session = requests.Session()
-        res = session.get(final_url, headers=headers, timeout=8, allow_redirects=True)
-        final_url = res.url
-        soup = BeautifulSoup(res.text, "html.parser")
+        response = requests.get(final_url, headers=headers, timeout=8)
+        soup = BeautifulSoup(response.text, "html.parser")
+        final_url = response.url # Update again just in case
 
-        og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
-        if og_title and og_title.get("content"):
-            raw_title = og_title["content"].strip()
-        elif soup.title and soup.title.string:
-            raw_title = soup.title.string.strip()
+        # Extract Title
+        og_title = soup.find("meta", property="og:title")
+        raw_title = og_title["content"].strip() if og_title else (soup.title.string.strip() if soup.title else "")
+        
+        # Clean Title
+        clean_title = re.sub(r'\s*[\|\-–]\s*(Amazon|Flipkart|Myntra|Ajio|Nykaa).*', '', raw_title, flags=re.IGNORECASE).strip()
+        if not clean_title or re.match(r'^[!\W]*[A-Za-z0-9]{8,}$', clean_title):
+            clean_title = share_title or "Featured Deal Product"
 
-        og_desc = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "twitter:description"})
-        if og_desc and og_desc.get("content"):
-            desc = og_desc["content"].strip()
+        # Extract Description
+        og_desc = soup.find("meta", property="og:description")
+        desc = og_desc["content"].strip() if og_desc else ""
 
-        live_price = extract_flipkart_price(res.text)
-        if not live_price:
-            meta_price = soup.find("meta", property="product:price:amount") or soup.find("meta", property="og:price:amount")
-            if meta_price and meta_price.get("content"):
-                live_price = f"₹{meta_price['content'].strip()}"
-        if not live_price:
-            live_price = extract_price_from_jsonld(soup)
-        if not live_price:
-            live_price = extract_price_from_text(desc) or extract_price_from_text(res.text)
+        # Extract Price (Live price prioritised over share text price)
+        live_price = get_live_price(response.text, soup)
+        final_price = live_price if live_price else share_price
 
-        if live_price:
-            price = live_price
-
+        return {
+            "url": final_url,
+            "title": clean_title,
+            "price": final_price if final_price else "Check Link",
+            "desc": desc
+        }
     except Exception:
-        pass
+        return {
+            "url": final_url,
+            "title": share_title or "Featured Deal Product",
+            "price": share_price or "Check Link",
+            "desc": ""
+        }
 
-    # Step 3: Parse cleaned title using expanded URL slug as fallback
-    title = clean_title(raw_title, final_url, raw_user_text)
-
-    return {
-        "url": final_url,
-        "title": title,
-        "price": price if price else "Check Link",
-        "desc": desc,
-    }
-
-def get_numeric_price(price_str: str):
-    if not price_str:
-        return None
-    digits = re.sub(r'[^\d.]', '', price_str)
-    try:
-        return float(digits) if digits else None
-    except ValueError:
-        return None
-
-# ---------------------------------------------------------------------------
-# 6. Groq AI Engine (Prasad Tech Telugu Formatting)
-# ---------------------------------------------------------------------------
-def build_master_prompt(user_input: str, scraped_info: dict, deal_type: str = "NORMAL") -> str:
-    category_list = ", ".join(CATEGORIES)
-    return f"""You are an automated deal poster formatting strict, ultra-clean Telegram deals exactly like Prasad Tech in Telugu.
+# ==============================================================================
+# 5. AI FORMATTING ENGINE (Groq)
+# ==============================================================================
+def format_deal_with_ai(product_data: dict, extra_notes: str, deal_type: str) -> str:
+    """Generates the Prasad Tech in Telugu 4-line format using Groq AI."""
+    prompt = f"""You are an automated deal poster. Format the output STRICTLY like 'Prasad Tech in Telugu'.
 
 INPUT DATA:
-- Product Title: {scraped_info.get('title', '')}
-- Live Deal Price: {scraped_info.get('price', 'Check Link')}
-- Buy Link: {scraped_info.get('url', '')}
-- Product Specs: {scraped_info.get('desc', '')}
-- User Notes: {user_input}
-- Deal Type: {deal_type}
+- Title: {product_data.get('title')}
+- Price: {product_data.get('price')}
+- Link: {product_data.get('url')}
+- Specs: {product_data.get('desc')}
+- User Notes: {extra_notes}
+- Type: {deal_type}
 
-OUTPUT ONLY the exact template below. NO intro, NO explanatory text, NO markdown code fences, NO conversational conclusions.
+OUTPUT TEMPLATE:
+🔥🔥 [Full Product Title with Main Specs]
 
-🔥🔥 [Full Product Title with Main Specs like RAM/Storage/Color/Wattage]
-
-🎁 Deal Price : {scraped_info.get('price', 'Check Link')}
+🎁 Deal Price : {product_data.get('price')}
 
 🔍 Cross Platform Price : Best Competitive Offer Across Market
 
-Buy Here : {scraped_info.get('url', '')}
+Buy Here : {product_data.get('url')}
 
-💥 Bank Offer : [Extract active bank offer if present in specs/notes, otherwise OMIT this entire line]
+💥 Bank Offer : [Extract bank offer if present, else remove this line]
 
-[Exactly ONE hashtag from this official list: {category_list}]
+[Exactly ONE category hashtag from this list: {", ".join(CATEGORIES)}]
 
-STRICT RULES:
-1. The buy link appears EXACTLY ONCE, under "Buy Here :". Never repeat it.
-2. No fluff sentences.
-3. Pick exactly one category hashtag from the official list above.
-"""
+RULES: No intro, no conversational text. The link MUST be printed exactly once."""
 
-def call_groq_ai(prompt: str) -> str:
     last_error = None
-    for client in [groq_client, groq_client_backup]:
-        if client is None:
-            continue
+    for ai_client in [primary_ai, backup_ai]:
+        if not ai_client: continue
         try:
-            completion = client.chat.completions.create(
+            res = ai_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=500
             )
-            return completion.choices[0].message.content.strip()
+            return res.choices[0].message.content.strip()
         except Exception as e:
             last_error = e
-            continue
-    raise Exception(f"Groq API call failed on all available keys: {last_error}")
+            
+    return f"❌ AI Generation Failed: {last_error}"
 
-# ---------------------------------------------------------------------------
-# 7. Telegram Handlers & Auto-Posting Logic
-# ---------------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🚀 AI Agent For Deals is Active!\n\n"
-        "• Send any product link to get an instant formatted deal post.\n"
-        "• /track [Link] [Price] - Set a personal price-drop alert\n"
-        "• /mytracks - View your active price alerts\n"
-        "• /bypass [Link] - Admin-only: verified premium deal\n"
-        "• /sponsored [Link] - Admin-only: sponsored promotion"
-    )
+# ==============================================================================
+# 6. TELEGRAM BOT HANDLERS
+# ==============================================================================
+async def process_deal_request(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, deal_type="NORMAL"):
+    """Core pipeline: Extract URL -> Scrape -> AI Format -> Reply & Post."""
+    url_match = re.search(r'https?://\S+', user_text)
+    
+    if not url_match:
+        await update.message.reply_text("⚠️ No valid link found in your message.")
+        return
 
-async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
-    if not CHANNEL_ID:
-        return False
     try:
-        await context.bot.send_message(chat_id=CHANNEL_ID, text=text)
-        return True
-    except Exception as e:
-        if ADMIN_CHAT_ID:
-            try:
-                await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=f"⚠️ Failed to post to channel: {e}")
-            except Exception:
-                pass
-        return False
-
-async def handle_deal_request(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, deal_type: str = "NORMAL"):
-    try:
-        url_match = re.search(r'https?://\S+', raw_text)
-        scraped = scrape_link_data(url_match.group(0), raw_user_text=raw_text) if url_match else {
-            "url": "", "title": clean_title("", "", raw_text), "price": "Check Link", "desc": ""
-        }
-
-        prompt = build_master_prompt(raw_text, scraped, deal_type)
-        formatted_deal = call_groq_ai(prompt)
-
-        await update.message.reply_text(formatted_deal)
-
+        # 1. Scrape Info
+        scraped_data = scrape_product_info(url_match.group(0), user_text)
+        
+        # 2. Format with AI
+        formatted_post = format_deal_with_ai(scraped_data, user_text, deal_type)
+        
+        # 3. Reply to Admin
+        await update.message.reply_text(formatted_post)
+        
+        # 4. Auto-Post to Channel
         if CHANNEL_ID:
-            posted = await post_to_channel(context, formatted_deal)
-            if not posted:
-                await update.message.reply_text("⚠️ Could not post to channel - check bot admin rights in channel.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error processing deal: {str(e)}")
-        if ADMIN_CHAT_ID:
             try:
-                await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=f"⚠️ Exception in handle_deal_request: {e}")
-            except Exception:
-                pass
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=formatted_post)
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Channel Post Failed: {e}")
+                
+    except Exception as e:
+        await update.message.reply_text(f"❌ Processing Error: {e}")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_deal_request(update, context, update.message.text, deal_type="NORMAL")
+async def handle_standard_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await process_deal_request(update, context, update.message.text, "NORMAL")
 
-async def bypass_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Unauthorized: restricted to bot admin.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /bypass [Product Link/Details]")
-        return
-    await handle_deal_request(update, context, " ".join(context.args), deal_type="BYPASS_PREMIUM")
+async def cmd_bypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != ADMIN_CHAT_ID: return
+    await process_deal_request(update, context, " ".join(context.args), "BYPASS_PREMIUM")
 
-async def sponsored_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Unauthorized: restricted to bot admin.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /sponsored [Product Link/Details]")
-        return
-    await handle_deal_request(update, context, " ".join(context.args), deal_type="SPONSORED")
-
-async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets a price alert in SQLite."""
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /track [Product Link] [Target Price]")
+        await update.message.reply_text("Usage: /track [Link] [TargetPrice]")
         return
     try:
         link = context.args[0]
-        target_price = float(context.args[1].replace(",", ""))
-        user_id = update.effective_user.id
+        price = float(context.args[1].replace(",", ""))
+        
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT INTO price_alerts (user_id, product_link, target_price) VALUES (?, ?, ?)", 
+                         (update.effective_user.id, link, price))
+            
+        await update.message.reply_text(f"✅ Alert set! Will notify when price drops to ₹{price:.2f}")
+    except Exception:
+        await update.message.reply_text("❌ Invalid price format.")
 
-        conn = get_conn()
-        conn.execute(
-            "INSERT INTO price_alerts (user_id, product_link, target_price) VALUES (?, ?, ?)",
-            (user_id, link, target_price),
-        )
-        conn.commit()
-        conn.close()
+# ==============================================================================
+# 7. BACKGROUND JOB (Price Drop Monitor)
+# ==============================================================================
+async def background_price_checker(context: ContextTypes.DEFAULT_TYPE):
+    """Checks tracked products every hour for price drops."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        active_alerts = conn.execute("SELECT * FROM price_alerts WHERE status = 'ACTIVE'").fetchall()
 
-        await update.message.reply_text(
-            f"✅ Price alert saved for ₹{target_price:.2f}. Checked every {PRICE_CHECK_MINUTES} min."
-        )
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a valid numerical target price.")
-
-async def mytracks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, product_link, target_price, status FROM price_alerts WHERE user_id = ? ORDER BY id DESC",
-        (update.effective_user.id,),
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        await update.message.reply_text("You have no active price alerts.")
-        return
-
-    lines = [f"#{r['id']} [{r['status']}] ₹{r['target_price']:.2f} - {r['product_link']}" for r in rows]
-    await update.message.reply_text("\n".join(lines))
-
-# ---------------------------------------------------------------------------
-# 8. Background Job Engine (Scheduled Price Alert Checking)
-# ---------------------------------------------------------------------------
-async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, user_id, product_link, target_price FROM price_alerts WHERE status = 'ACTIVE'"
-    ).fetchall()
-    conn.close()
-
-    for row in rows:
+    for alert in active_alerts:
         try:
-            scraped = scrape_link_data(row["product_link"])
-            current_price = get_numeric_price(scraped.get("price", ""))
-            if current_price is not None and current_price <= row["target_price"]:
-                await context.bot.send_message(
-                    chat_id=row["user_id"],
-                    text=(
-                        f"🔥 Price Drop Alert!\n\n{scraped.get('title', 'Your tracked product')}\n"
-                        f"Now: ₹{current_price:.2f} (target was ₹{row['target_price']:.2f})\n"
-                        f"Buy: {scraped.get('url', row['product_link'])}"
-                    ),
-                )
-                conn = get_conn()
-                conn.execute("UPDATE price_alerts SET status = 'TRIGGERED' WHERE id = ?", (row["id"],))
-                conn.commit()
-                conn.close()
-        except Exception as e:
-            if ADMIN_CHAT_ID:
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(ADMIN_CHAT_ID), text=f"⚠️ Price check failed for alert #{row['id']}: {e}"
-                    )
-                except Exception:
-                    pass
+            data = scrape_product_info(alert["product_link"], "")
+            digits = re.sub(r'[^\d.]', '', data.get("price", ""))
+            current_price = float(digits) if digits else None
 
-# ---------------------------------------------------------------------------
-# 9. Main Application Entry Point
-# ---------------------------------------------------------------------------
+            if current_price and current_price <= alert["target_price"]:
+                msg = f"🔥 PRICE DROP ALERT!\n\n{data['title']}\nNow: ₹{current_price}\nLink: {data['url']}"
+                await context.bot.send_message(chat_id=alert["user_id"], text=msg)
+                
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE price_alerts SET status = 'TRIGGERED' WHERE id = ?", (alert["id"],))
+        except Exception:
+            continue
+
+# ==============================================================================
+# 8. MAIN APPLICATION RUNNER
+# ==============================================================================
 if __name__ == "__main__":
+    print("🚀 Starting Deals AI Agent...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("bypass", bypass_command))
-    app.add_handler(CommandHandler("sponsored", sponsored_command))
-    app.add_handler(CommandHandler("track", track_command))
-    app.add_handler(CommandHandler("mytracks", mytracks_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Commands & Handlers
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("✅ Deals Bot is Online!")))
+    app.add_handler(CommandHandler("bypass", cmd_bypass))
+    app.add_handler(CommandHandler("track", cmd_track))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_standard_message))
 
-    app.job_queue.run_repeating(check_price_alerts, interval=PRICE_CHECK_MINUTES * 60, first=60)
+    # Start Background Job Scheduler
+    app.job_queue.run_repeating(background_price_checker, interval=PRICE_CHECK_MINUTES * 60, first=60)
 
     app.run_polling()
-            
